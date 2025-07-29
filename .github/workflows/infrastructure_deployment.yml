@@ -1,0 +1,317 @@
+name: Infrastructure Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Terraform Action'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: plan
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - '**/*.tpl'
+  #     - '**/*.tf'
+  #     - '**/*.example'
+  #     - '**/*.yml'
+  #     - '**/*.yaml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '**/*.tpl'
+      - '**/*.tf'
+      - '**/*.example'
+      - '**/*.yml'
+      - '**/*.yaml'
+
+env:
+  ALLOWED_SSH_CIDR: ${{ vars.ALLOWED_SSH_CIDR }}            # Allowed CIDR for Bastion and public instances access. Set this in GitHub Variables
+  AWS_REGION: ${{ vars.AWS_REGION }}                        # AWS default region. Set this in GitHub Variables
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}             # AWS account ID. Set this in GitHub Secrets
+  AZS: ${{ vars.AZS }}                                      # AWS Availability Zones. Set this in GitHub Variables
+  ENVIRONMENT_NAME: ${{ vars.ENVIRONMENT_NAME }}            # Environment name. Set this in GitHub Variables
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}                     # GitHub token for commenting on PRs
+  INSTANCE_TYPE_BASTION: ${{ vars.INSTANCE_TYPE_BASTION }}  # AWS EC2 instance type. Set this in GitHub Variables
+  INSTANCE_TYPE_CP: ${{ vars.INSTANCE_TYPE_CP }}            # AWS EC2 instance type. Set this in GitHub Variables
+  INSTANCE_TYPE_WORKER: ${{ vars.INSTANCE_TYPE_WORKER }}    # AWS EC2 instance type. Set this in GitHub Variables
+  JENKINS_DATA_DIR: ${{ vars.JENKINS_DATA_DIR }}            # Jenkins local persistent data directory path. Set this in GitHub Variables
+  PRIVATE_SUBNET_CIDRS: ${{ vars.PRIVATE_SUBNET_CIDRS }}    # AWS Private subnet CIDRs. Set this in GitHub Variables
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}                    # Project name. Set this in GitHub Variables
+  PUBLIC_SUBNET_CIDRS: ${{ vars.PUBLIC_SUBNET_CIDRS }}      # AWS Public subnet CIDRs. Set this in GitHub Variables
+  ROUTE53_DOMAIN: ${{ vars.ROUTE53_DOMAIN }}                # AWS Route53 domain. Set this in GitHub Variables
+  WORKING_DIR_INFRA: ${{ vars.WORKING_DIR_INFRA }}          # Working directory for Terraform. Set this in GitHub Variables
+  TF_VERSION: ${{ vars.TF_VERSION }}                        # Terraform version. Set this in GitHub Variables
+  VERIFIED_EMAIL: ${{ vars.VERIFIED_EMAIL }}                # Email address to be verified with SES. Set this in GitHub Variables
+  VPC_CIDR: ${{ vars.VPC_CIDR }}                            # AWS VPC CIDR. Set this in GitHub Variables
+
+permissions:
+  id-token: write       # Required for OIDC token exchange
+  contents: read        # Required to checkout the repo
+  pull-requests: write  # Required to comment on PRs
+  actions: read         # Required to upload artifacts
+  issues: write         # Required to comment on issues
+  checks: write         # Required to update checks on PRs
+  statuses: write       # Required to update commit statuses
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    if : ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan' || github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply' }}
+    # if : ${{ github.event.inputs.action == 'plan' || github.event_name == 'pull_request' }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GithubActionRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-terraform-plan
+
+      - name: Generate terraform.auto.tfvars
+        run: |
+          cat <<EOF > terraform.auto.tfvars
+          vpc_cidr              = "${{ env.VPC_CIDR }}"
+          aws_region            = "${{ env.AWS_REGION }}"
+          aws_account_id        = "${{ env.AWS_ACCOUNT_ID }}"
+          azs                   = ${{ env.AZS }}
+          public_subnet_cidrs   = ${{ env.PUBLIC_SUBNET_CIDRS }}
+          private_subnet_cidrs  = ${{ env.PRIVATE_SUBNET_CIDRS }}
+          allowed_ssh_cidr      = "${{ env.ALLOWED_SSH_CIDR }}"
+          instance_type_bastion = "${{ env.INSTANCE_TYPE_BASTION }}"
+          instance_type_cp      = "${{ env.INSTANCE_TYPE_CP }}"
+          instance_type_worker  = "${{ env.INSTANCE_TYPE_WORKER }}"
+          jenkins_data_dir      = "${{ env.JENKINS_DATA_DIR }}"
+          project_name          = "${{ env.PROJECT_NAME }}"
+          environment_name      = "${{ env.ENVIRONMENT_NAME }}"
+          route53_domain        = "${{ env.ROUTE53_DOMAIN }}"
+          verified_email        = "${{ env.VERIFIED_EMAIL }}"
+
+          EOF
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Terraform Init
+        id: init
+        run: terraform init
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd ${{ env.WORKING_DIR_INFRA }}
+          terraform  plan -no-color -out=output.tfplan
+
+      - name: Terraform Show to file
+        if: github.event_name == 'pull_request'
+        run: terraform show -no-color output.tfplan > tfplan.txt
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            ${{ env.WORKING_DIR_INFRA }}/output.tfplan
+            ${{ env.WORKING_DIR_INFRA }}/tfplan.txt
+
+      - name: Comment Plan on PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style')
+            })
+
+            // 2. Prepare format of the comment
+            const output = `#### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.WORKING_DIR_INFRA }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            // 3. If we have a comment, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply' }}
+    # if: ${{ github.event.inputs.action == 'apply' || github.event_name == 'pull_request' }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GithubActionRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-terraform-apply
+
+      - name: Generate terraform.auto.tfvars
+        run: |
+          cat <<EOF > terraform.auto.tfvars
+          vpc_cidr              = "${{ env.VPC_CIDR }}"
+          aws_region            = "${{ env.AWS_REGION }}"
+          aws_account_id        = "${{ env.AWS_ACCOUNT_ID }}"
+          azs                   = ${{ env.AZS }}
+          public_subnet_cidrs   = ${{ env.PUBLIC_SUBNET_CIDRS }}
+          private_subnet_cidrs  = ${{ env.PRIVATE_SUBNET_CIDRS }}
+          allowed_ssh_cidr      = "${{ env.ALLOWED_SSH_CIDR }}"
+          instance_type_bastion = "${{ env.INSTANCE_TYPE_BASTION }}"
+          instance_type_cp      = "${{ env.INSTANCE_TYPE_CP }}"
+          instance_type_worker  = "${{ env.INSTANCE_TYPE_WORKER }}"
+          jenkins_data_dir      = "${{ env.JENKINS_DATA_DIR }}"
+          project_name          = "${{ env.PROJECT_NAME }}"
+          environment_name      = "${{ env.ENVIRONMENT_NAME }}"
+          route53_domain        = "${{ env.ROUTE53_DOMAIN }}"
+          verified_email        = "${{ env.VERIFIED_EMAIL }}"
+
+          EOF
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Download Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Terraform Apply
+        run: terraform apply output.tfplan
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    # needs: terraform-apply
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy' }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GithubActionRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-terraform-destroy
+
+      - name: Generate terraform.auto.tfvars
+        run: |
+          cat <<EOF > terraform.auto.tfvars
+          vpc_cidr              = "${{ env.VPC_CIDR }}"
+          aws_region            = "${{ env.AWS_REGION }}"
+          aws_account_id        = "${{ env.AWS_ACCOUNT_ID }}"
+          azs                   = ${{ env.AZS }}
+          public_subnet_cidrs   = ${{ env.PUBLIC_SUBNET_CIDRS }}
+          private_subnet_cidrs  = ${{ env.PRIVATE_SUBNET_CIDRS }}
+          allowed_ssh_cidr      = "${{ env.ALLOWED_SSH_CIDR }}"
+          instance_type_bastion = "${{ env.INSTANCE_TYPE_BASTION }}"
+          instance_type_cp      = "${{ env.INSTANCE_TYPE_CP }}"
+          instance_type_worker  = "${{ env.INSTANCE_TYPE_WORKER }}"
+          jenkins_data_dir      = "${{ env.JENKINS_DATA_DIR }}"
+          project_name          = "${{ env.PROJECT_NAME }}"
+          environment_name      = "${{ env.ENVIRONMENT_NAME }}"
+          route53_domain        = "${{ env.ROUTE53_DOMAIN }}"
+          verified_email        = "${{ env.VERIFIED_EMAIL }}"
+
+          EOF
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ${{ env.WORKING_DIR_INFRA }}
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
+        working-directory: ${{ env.WORKING_DIR_INFRA }}

@@ -1,0 +1,602 @@
+name: "K8s Management"
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action'
+        required: true
+        type: choice
+        options:
+          - deploy Jenkins
+          - deploy Flask
+          - destroy Jenkins
+          - destroy Flask
+
+  # workflow_run:
+  #   workflows: ["Infrastructure Deployment"]
+  #   types:
+  #     - completed
+  #   branches:
+  #     - task_7
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}                                  # AWS default region. Set this in GitHub Variables
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}                       # AWS account ID. Set this in GitHub Secrets
+  DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}             # Docker Hub username. Set this in GitHub Secrets
+  DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}                   # Docker Hub token. Set this in GitHub Secrets
+  ENVIRONMENT_NAME: ${{ vars.ENVIRONMENT_NAME }}                      # Environment name. Set this in GitHub Variables
+  JENKINS_ADMIN_USERNAME: ${{ secrets.JENKINS_ADMIN_USERNAME }}       # Jenkins admin username. Set this in GitHub Secrets
+  JENKINS_ADMIN_PASSWORD: ${{ secrets.JENKINS_ADMIN_PASSWORD }}       # Jenkins admin password. Set this in GitHub Secrets
+  JENKINS_DATA_DIR: ${{ vars.JENKINS_DATA_DIR }}                      # Jenkins data directory. Set this in GitHub Variables
+  JENKINS_MAIL_USERNAME: ${{ secrets.JENKINS_MAIL_USERNAME }}         # Jenkins mail username. Set this in GitHub Secrets
+  JENKINS_MAIL_PASSWORD: ${{ secrets.JENKINS_MAIL_PASSWORD }}       # Jenkins mail password. Set this in GitHub Secrets
+  JENKINS_USER_LOGIN: ${{ secrets.JENKINS_USER_LOGIN }}               # Jenkins user login. Set this in GitHub Secrets
+  JENKINS_USER_DISPLAY_NAME: ${{ secrets.JENKINS_USER_DISPLAY_NAME }} # Jenkins user display name. Set this in GitHub Secrets
+  JENKINS_USER_PASSWORD: ${{ secrets.JENKINS_USER_PASSWORD }}         # Jenkins user password. Set this in GitHub Secrets
+  JENKINS_USER_EMAIL: ${{ secrets.JENKINS_USER_EMAIL }}               # Jenkins user email. Set this in GitHub Secrets
+  JENKINS_URL: ${{ secrets.JENKINS_URL }}                             # Jenkins URL. Set this in GitHub Secrets
+  GH_JENKINS_TOKEN: ${{ secrets.GH_JENKINS_TOKEN }}                   # GitHub token for Jenkins. Set this in GitHub Secrets
+  GH_JENKINS_SSH_KEY: ${{ secrets.GH_JENKINS_SSH_KEY }}               # GitHub SSH key for Jenkins. Set this in GitHub Secrets
+  PROJECT_NAME: ${{ vars.PROJECT_NAME }}                              # Project name. Set this in GitHub Variables
+  ROUTE53_DOMAIN: ${{ vars.ROUTE53_DOMAIN }}                          # AWS Route53 domain. Set this in GitHub Variables
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}                             # SonarQube token. Set this in GitHub Secrets
+  WORKING_DIR_MAIN: ${{ vars.WORKING_DIR_MAIN }}                      # Main working directory. Set this in GitHub Variables
+
+permissions:
+  id-token: write       # Required for OIDC token exchange
+  contents: read        # Required to checkout the repo
+  pull-requests: write  # Required to comment on PRs
+  actions: read         # Required to upload artifacts
+  issues: write         # Required to comment on issues
+  checks: write         # Required to update checks on PRs
+  statuses: write       # Required to update commit statuses
+
+jobs:
+  setup-env-vars:
+    runs-on: ubuntu-latest
+    outputs:
+      WORKING_DIR_KUBERNETES: ${{ steps.set-env.outputs.WORKING_DIR_KUBERNETES }}
+      KUBECONFIG_PARAM_PATH: ${{ steps.set-env.outputs.KUBECONFIG_PARAM_PATH }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Set up Environment Variables
+        id: set-env
+        run: |
+          echo "WORKING_DIR_KUBERNETES=${{ env.WORKING_DIR_MAIN }}/kubernetes" >> $GITHUB_OUTPUT
+          echo "KUBECONFIG_PARAM_PATH=/${{ env.PROJECT_NAME}}/${{ env.ENVIRONMENT_NAME }}/kube/kubeconfig" >> $GITHUB_OUTPUT
+
+  deploy_jenkins:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy Jenkins' }}
+    # if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy Jenkins' }}
+    runs-on: ubuntu-latest
+    needs: setup-env-vars
+    env:
+      KUBECONFIG_PARAM_PATH: ${{ needs.setup-env-vars.outputs.KUBECONFIG_PARAM_PATH }}
+      WORKING_DIR_KUBERNETES: ${{ needs.setup-env-vars.outputs.WORKING_DIR_KUBERNETES }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GithubActionRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-k8s-management
+
+      - name: Get GitHub Runner IP
+        id: runner_ip
+        run: |
+          echo "RUNNER_IP=$(curl -s https://checkip.amazonaws.com)/32" >> $GITHUB_ENV
+
+      - name: Save Bastion SG ID
+        run: |
+          echo "BASTION_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=tag:Name,Values=*bastion*" \
+            --query "SecurityGroups[*].GroupId" \
+            --output text)" >> $GITHUB_ENV
+
+      - name: Add GitHub Runner IP to Security Group
+        env:
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+          BASTION_SG_ID: ${{ env.BASTION_SG_ID }}
+        run: |
+          echo "Adding $RUNNER_IP to Security Group ${{ env.BASTION_SG_ID }}"
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ env.BASTION_SG_ID }} \
+            --protocol tcp \
+            --port 6443 \
+            --cidr $RUNNER_IP
+
+      - name: Set up Kubeconfig
+        run: |
+          aws ssm get-parameter \
+            --name "${{ env.KUBECONFIG_PARAM_PATH }}" \
+            --with-decryption \
+            --query "Parameter.Value" \
+            --output text > kubeconfig
+          chmod 600 kubeconfig
+          cp kubeconfig kubeconfig_raw
+          sed -i "s|^\( *server: https://\)[^:]*|\1k8s.${{ env.ROUTE53_DOMAIN }}|" kubeconfig
+          echo "export KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Jinja2 CLI
+        run: |
+          pip install jinja2-cli
+
+      - name: Render Jenkins manifests for Helm chart from Jinja2 templates
+        run: |
+          KUBECONFIG_CONTENT=$(base64 -w 0 ../kubeconfig_raw)
+          jinja2 jenkins_values.yaml.j2 \
+            -D JENKINS_ADMIN_USERNAME='${{ env.JENKINS_ADMIN_USERNAME }}' \
+            -D JENKINS_ADMIN_PASSWORD='${{ env.JENKINS_ADMIN_PASSWORD }}' \
+            -D JENKINS_MAIL_USERNAME='${{ env.JENKINS_MAIL_USERNAME }}' \
+            -D JENKINS_MAIL_PASSWORD='${{ env.JENKINS_MAIL_PASSWORD }}' \
+            -D JENKINS_USER_LOGIN='${{ env.JENKINS_USER_LOGIN }}' \
+            -D JENKINS_USER_DISPLAY_NAME='${{ env.JENKINS_USER_DISPLAY_NAME }}' \
+            -D JENKINS_USER_PASSWORD='${{ env.JENKINS_USER_PASSWORD }}' \
+            -D JENKINS_USER_EMAIL='${{ env.JENKINS_USER_EMAIL }}' \
+            -D JENKINS_URL='${{ env.JENKINS_URL }}' \
+            -D GH_JENKINS_TOKEN='${{ env.GH_JENKINS_TOKEN }}' \
+            -D GH_JENKINS_SSH_KEY='${{ env.GH_JENKINS_SSH_KEY }}' \
+            -D DOCKER_HUB_USERNAME='${{ env.DOCKER_HUB_USERNAME }}' \
+            -D DOCKER_HUB_PASSWORD='${{ env.DOCKER_HUB_TOKEN }}' \
+            -D AWS_REGION='${{ env.AWS_REGION }}' \
+            -D AWS_ACCOUNT_ID='${{ env.AWS_ACCOUNT_ID }}' \
+            -D PROJECT_NAME='${{ env.PROJECT_NAME }}' \
+            -D ENVIRONMENT_NAME='${{ env.ENVIRONMENT_NAME }}' \
+            -D SONAR_TOKEN='${{ env.SONAR_TOKEN }}' \
+            -D KUBECONFIG_CONTENT="$KUBECONFIG_CONTENT" \
+            > jenkins_values.yaml
+          jinja2 jenkins_ingress_route.yaml.j2 \
+            -D ROUTE53_DOMAIN='${{ env.ROUTE53_DOMAIN }}' \
+            > jenkins_ingress_route.yaml
+          jinja2 jenkins_pv.yaml.j2 \
+            -D JENKINS_DATA_DIR='${{ env.JENKINS_DATA_DIR }}' \
+            > jenkins_pv.yaml
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}/jenkins
+
+      - name: Render kube2iam manifests from Jinja2 templates
+        run: |
+          jinja2 kube2iam.yaml.j2 \
+            -D AWS_REGION='${{ env.AWS_REGION }}' \
+            -D AWS_ACCOUNT_ID='${{ env.AWS_ACCOUNT_ID }}' \
+            -D PROJECT_NAME='${{ env.PROJECT_NAME }}' \
+            -D ENVIRONMENT_NAME='${{ env.ENVIRONMENT_NAME }}' \
+            > kube2iam.yaml
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Install helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.18.3
+
+      - name: Create Jenkins Namespace
+        run: |
+          if ! kubectl get namespace jenkins \
+              --kubeconfig kubeconfig > /dev/null 2>&1; then
+            echo "Namespace 'jenkins' does not exist. Creating..."
+            kubectl create namespace jenkins \
+              --dry-run=client -o yaml \
+              --kubeconfig kubeconfig | \
+            kubectl apply -f - --kubeconfig kubeconfig
+          else
+            echo "Namespace 'jenkins' already exists. Skipping creation."
+          fi
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Create Jenkins service account
+        run: |
+          kubectl apply -f jenkins_sa.yaml -n jenkins --kubeconfig ../kubeconfig
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}/jenkins
+
+      - name: Apply Persistent Storage Configuration (Optional)
+        run: |
+          kubectl apply -f jenkins_storage_class.yaml -n jenkins --kubeconfig ../kubeconfig
+          kubectl apply -f jenkins_pv.yaml -n jenkins --kubeconfig ../kubeconfig
+          kubectl apply -f jenkins_pvc.yaml -n jenkins --kubeconfig ../kubeconfig
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}/jenkins
+
+      - name: Deploy Jenkins with Helm
+        run: |
+          helm repo add jenkins https://charts.jenkins.io
+          helm repo update
+          helm upgrade --install my-jenkins jenkins/jenkins \
+          --namespace jenkins \
+          --values jenkins_values.yaml \
+          --kubeconfig ../kubeconfig
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}/jenkins
+
+      - name: Apply Jenkins Ingress Route (Optional)
+        run: |
+          kubectl apply -f jenkins_ingress_route.yaml -n jenkins --kubeconfig ../kubeconfig
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}/jenkins
+
+      - name: Collect Jenkins Deployment Info
+        id: jenkins-info
+        run: |
+          echo '::group::kubectl get svc -n jenkins --kubeconfig kubeconfig'
+          kubectl get svc -n jenkins --kubeconfig kubeconfig > svc.txt
+          cat svc.txt
+          echo '::endgroup::'
+
+          echo '::group::helm status my-jenkins -n jenkins --kubeconfig kubeconfig'
+          helm status my-jenkins -n jenkins --kubeconfig kubeconfig > status.txt
+          cat status.txt
+          echo '::endgroup::'
+
+          echo "svc_output<<EOF" >> $GITHUB_OUTPUT
+          cat svc.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "helm_output<<EOF" >> $GITHUB_OUTPUT
+          cat status.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Deploy kube2iam
+        run: |
+          kubectl apply -f kube2iam.yaml --kubeconfig kubeconfig
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Add kube2iam label to nodes
+        run: |
+          kubectl label nodes --all iam.amazonaws.com/allowed=true --overwrite --kubeconfig kubeconfig
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Remove IP from Security Group
+        if: always()
+        env:
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+          BASTION_SG_ID: ${{ env.BASTION_SG_ID }}
+        run: |
+          echo "Removing $RUNNER_IP from Security Group ${{ env.BASTION_SG_ID }}"
+          aws ec2 revoke-security-group-ingress \
+            --group-id ${{ env.BASTION_SG_ID }} \
+            --protocol tcp \
+            --port 6443 \
+            --cidr $RUNNER_IP
+
+      - name: Comment Jenkins Deployment Info on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          svc_output: ${{ steps.jenkins-info.outputs.svc_output }}
+          helm_output: ${{ steps.jenkins-info.outputs.helm_output }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Jenkins Deployment Status')
+            })
+
+            const { svc_output, helm_output } = process.env;
+
+            // 2. Prepare format of the comment
+            const output = `### 🚀 Jenkins Deployment Status`
+
+            #### 🧭 Helm Status:
+            \`\`\`
+            ${helm_output}
+            \`\`\`
+
+            #### 🛰 Service Info:
+            \`\`\`
+            ${svc_output}
+            \`\`\`
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.WORKING_DIR_MAIN }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            // 3. If we have a comment, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
+
+  deploy_flask:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy Flask' }}
+    runs-on: ubuntu-latest
+    needs: setup-env-vars
+    env:
+      KUBECONFIG_PARAM_PATH: ${{ needs.setup-env-vars.outputs.KUBECONFIG_PARAM_PATH }}
+      WORKING_DIR_KUBERNETES: ${{ needs.setup-env-vars.outputs.WORKING_DIR_KUBERNETES }}
+
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for emulating other architectures)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx (for multi-arch support)
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKER_HUB_USERNAME }}
+          password: ${{ env.DOCKER_HUB_TOKEN }}
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ env.WORKING_DIR_MAIN }}/app
+          file: ./${{ env.WORKING_DIR_MAIN }}/app/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ivandevelop/flask-app:latest
+            ivandevelop/flask-app:${{ github.sha }}
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GithubActionRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-k8s-management
+
+      - name: Get GitHub Runner IP
+        id: runner_ip
+        run: |
+          echo "RUNNER_IP=$(curl -s https://checkip.amazonaws.com)/32" >> $GITHUB_ENV
+
+      - name: Save Bastion SG ID
+        run: |
+          echo "BASTION_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=tag:Name,Values=*bastion*" \
+            --query "SecurityGroups[*].GroupId" \
+            --output text)" >> $GITHUB_ENV
+
+      - name: Add GitHub Runner IP to Security Group
+        env:
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+          BASTION_SG_ID: ${{ env.BASTION_SG_ID }}
+        run: |
+          echo "Adding $RUNNER_IP to Security Group ${{ env.BASTION_SG_ID }}"
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ env.BASTION_SG_ID }} \
+            --protocol tcp \
+            --port 6443 \
+            --cidr $RUNNER_IP
+
+      - name: Set up Kubeconfig
+        run: |
+          aws ssm get-parameter \
+            --name "${{ env.KUBECONFIG_PARAM_PATH }}" \
+            --with-decryption \
+            --query "Parameter.Value" \
+            --output text > kubeconfig
+                chmod 600 kubeconfig
+          sed -i "s|^\( *server: https://\)[^:]*|\1k8s.${{ env.ROUTE53_DOMAIN }}|" kubeconfig
+          echo "export KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Install helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.18.3
+
+      - name: Create Flask Namespace
+        run: |
+          if ! kubectl get namespace flask-app \
+              --kubeconfig kubeconfig > /dev/null 2>&1; then
+            echo "Namespace 'flask-app' does not exist. Creating..."
+            kubectl create namespace flask-app \
+              --dry-run=client -o yaml \
+              --kubeconfig kubeconfig | \
+            kubectl apply -f - --kubeconfig kubeconfig
+          else
+            echo "Namespace 'flask-app' already exists. Skipping creation."
+          fi
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Deploy Flask with Helm
+        run: |
+          helm upgrade --install flask-app . \
+          --namespace flask-app \
+          --values values.yaml \
+          --kubeconfig ../../kubernetes/kubeconfig
+        working-directory: ${{ env.WORKING_DIR_MAIN }}/helm/flask-app
+
+      - name: Remove IP from Security Group
+        if: always()
+        env:
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+          BASTION_SG_ID: ${{ env.BASTION_SG_ID }}
+        run: |
+          echo "Removing $RUNNER_IP from Security Group ${{ env.BASTION_SG_ID }}"
+          aws ec2 revoke-security-group-ingress \
+            --group-id ${{ env.BASTION_SG_ID }} \
+            --protocol tcp \
+            --port 6443 \
+            --cidr $RUNNER_IP
+
+  destroy_jenkins:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy Jenkins' }}
+    runs-on: ubuntu-latest
+    needs: setup-env-vars
+    env:
+      KUBECONFIG_PARAM_PATH: ${{ needs.setup-env-vars.outputs.KUBECONFIG_PARAM_PATH }}
+      WORKING_DIR_KUBERNETES: ${{ needs.setup-env-vars.outputs.WORKING_DIR_KUBERNETES }}
+
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GithubActionRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-k8s-management
+
+      - name: Get GitHub Runner IP
+        id: runner_ip
+        run: |
+          echo "RUNNER_IP=$(curl -s https://checkip.amazonaws.com)/32" >> $GITHUB_ENV
+
+      - name: Save Bastion SG ID
+        run: |
+          echo "BASTION_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=tag:Name,Values=*bastion*" \
+            --query "SecurityGroups[*].GroupId" \
+            --output text)" >> $GITHUB_ENV
+
+      - name: Add GitHub Runner IP to Security Group
+        env:
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+          BASTION_SG_ID: ${{ env.BASTION_SG_ID }}
+        run: |
+          echo "Adding $RUNNER_IP to Security Group ${{ env.BASTION_SG_ID }}"
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ env.BASTION_SG_ID }} \
+            --protocol tcp \
+            --port 6443 \
+            --cidr $RUNNER_IP
+
+      - name: Set up Kubeconfig
+        run: |
+          aws ssm get-parameter \
+            --name "${{ env.KUBECONFIG_PARAM_PATH }}" \
+            --with-decryption \
+            --query "Parameter.Value" \
+            --output text > kubeconfig
+                chmod 600 kubeconfig
+          sed -i "s|^\( *server: https://\)[^:]*|\1k8s.${{ env.ROUTE53_DOMAIN }}|" kubeconfig
+          echo "export KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Uninstall Jenkins with Helm
+        run: |
+          helm uninstall my-jenkins --namespace jenkins --kubeconfig kubeconfig || echo "Jenkins already uninstalled."
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Delete Kubernetes Resources
+        run: |
+          kubectl delete -f . --kubeconfig ../kubeconfig --ignore-not-found
+          kubectl delete secret jenkins-admin --namespace jenkins --kubeconfig ../kubeconfig --ignore-not-found
+          kubectl delete namespace jenkins --kubeconfig ../kubeconfig --ignore-not-found
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}/jenkins
+
+      - name: Remove IP from Security Group
+        if: always()
+        env:
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+          BASTION_SG_ID: ${{ env.BASTION_SG_ID }}
+        run: |
+          echo "Removing $RUNNER_IP from Security Group ${{ env.BASTION_SG_ID }}"
+          aws ec2 revoke-security-group-ingress \
+            --group-id ${{ env.BASTION_SG_ID }} \
+            --protocol tcp \
+            --port 6443 \
+            --cidr $RUNNER_IP
+
+  destroy_flask:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy Flask' }}
+    runs-on: ubuntu-latest
+    needs: setup-env-vars
+    env:
+      KUBECONFIG_PARAM_PATH: ${{ needs.setup-env-vars.outputs.KUBECONFIG_PARAM_PATH }}
+      WORKING_DIR_KUBERNETES: ${{ needs.setup-env-vars.outputs.WORKING_DIR_KUBERNETES }}
+
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GithubActionRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-k8s-management
+
+      - name: Get GitHub Runner IP
+        id: runner_ip
+        run: |
+          echo "RUNNER_IP=$(curl -s https://checkip.amazonaws.com)/32" >> $GITHUB_ENV
+
+      - name: Save Bastion SG ID
+        run: |
+          echo "BASTION_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=tag:Name,Values=*bastion*" \
+            --query "SecurityGroups[*].GroupId" \
+            --output text)" >> $GITHUB_ENV
+
+      - name: Add GitHub Runner IP to Security Group
+        env:
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+          BASTION_SG_ID: ${{ env.BASTION_SG_ID }}
+        run: |
+          echo "Adding $RUNNER_IP to Security Group ${{ env.BASTION_SG_ID }}"
+          aws ec2 authorize-security-group-ingress \
+            --group-id ${{ env.BASTION_SG_ID }} \
+            --protocol tcp \
+            --port 6443 \
+            --cidr $RUNNER_IP
+
+      - name: Set up Kubeconfig
+        run: |
+          aws ssm get-parameter \
+            --name "${{ env.KUBECONFIG_PARAM_PATH }}" \
+            --with-decryption \
+            --query "Parameter.Value" \
+            --output text > kubeconfig
+                chmod 600 kubeconfig
+          sed -i "s|^\( *server: https://\)[^:]*|\1k8s.${{ env.ROUTE53_DOMAIN }}|" kubeconfig
+          echo "export KUBECONFIG=$(pwd)/kubeconfig" >> $GITHUB_ENV
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Uninstall Flask with Helm
+        run: |
+          helm uninstall flask-app --namespace flask-app --kubeconfig kubeconfig || echo "Flask already uninstalled."
+        working-directory: ${{ env.WORKING_DIR_KUBERNETES }}
+
+      - name: Remove IP from Security Group
+        if: always()
+        env:
+          RUNNER_IP: ${{ env.RUNNER_IP }}
+          BASTION_SG_ID: ${{ env.BASTION_SG_ID }}
+        run: |
+          echo "Removing $RUNNER_IP from Security Group ${{ env.BASTION_SG_ID }}"
+          aws ec2 revoke-security-group-ingress \
+            --group-id ${{ env.BASTION_SG_ID }} \
+            --protocol tcp \
+            --port 6443 \
+            --cidr $RUNNER_IP
