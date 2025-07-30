@@ -5,7 +5,8 @@ RS School AWS DevOps 2025 Q2 course
 <img width="1583" height="962" alt="image" src="https://github.com/user-attachments/assets/be69509f-d345-4ff2-b132-d81629a940db" />
 <img width="999" height="721" alt="image" src="https://github.com/user-attachments/assets/8fde7dd0-47e1-4e07-bda8-42ef5b604895" />
 <img width="1719" height="1019" alt="image" src="https://github.com/user-attachments/assets/82aabc6d-de5a-456c-9bad-da0bcf82bcee" />
-
+<img width="1719" height="988" alt="image" src="https://github.com/user-attachments/assets/4d07f12f-0540-418a-a6fb-8b53e7394e34" />
+<img width="1404" height="779" alt="image" src="https://github.com/user-attachments/assets/2299dc7b-1f67-4cd0-858a-c492867f600b" />
 
 ## Content:
 
